@@ -6,18 +6,27 @@ import numpy as np
 import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
-from datetime import timedelta
+from datetime import date, timedelta
 
+from pybaseball import statcast  # <-- NEW
 
 st.set_page_config(page_title="Pitcher Changes", layout="wide")
 
-CSV_PATH_DEFAULT = "/Users/ethanmann/Desktop/25_Full.csv"
+
+# ---------- DATA FETCHING ----------
+@st.cache_data(ttl=60 * 60 * 6)  # cache for 6 hours
+def fetch_statcast(start_date: str, end_date: str) -> pd.DataFrame:
+    df = statcast(start_dt=start_date, end_dt=end_date)
+
+    # Keep only MLB regular season games if column exists
+    if "game_type" in df.columns:
+        df = df[df["game_type"] == "R"].copy()
+
+    return df
 
 
 @st.cache_data
-def load_data(path: str) -> pd.DataFrame:
-    df = pd.read_csv(path)
-
+def prep_data(df: pd.DataFrame) -> pd.DataFrame:
     # Ensure date
     if "game_date" in df.columns:
         df["game_date"] = pd.to_datetime(df["game_date"], errors="coerce")
@@ -44,7 +53,7 @@ def load_data(path: str) -> pd.DataFrame:
     elif "pitcher_hand" not in df.columns:
         df["pitcher_hand"] = np.nan
 
-    # Batter handedness (only used for heatmap filtering)
+    # Batter handedness (heatmap filter only)
     if "stand" in df.columns and "batter_hand" not in df.columns:
         df["batter_hand"] = df["stand"]
     elif "batter_hand" not in df.columns:
@@ -64,7 +73,6 @@ def load_data(path: str) -> pd.DataFrame:
     # Pitcher team from home/away + inning_topbot
     if "team" not in df.columns:
         df["team"] = np.nan
-
     if {"home_team", "away_team", "inning_topbot"}.issubset(df.columns):
         top_mask = df["inning_topbot"].astype(str).str.upper().str.startswith("T")
         bot_mask = df["inning_topbot"].astype(str).str.upper().str.startswith("B")
@@ -126,10 +134,7 @@ def window_split(df: pd.DataFrame, last_days: int, baseline_days: int):
 
 
 def summarize(df: pd.DataFrame, min_pitches: int) -> pd.DataFrame:
-    g = df.groupby(
-        ["pitcher", "player_name", "pitch_type", "pitcher_hand", "team"],
-        dropna=False
-    )
+    g = df.groupby(["pitcher", "player_name", "pitch_type", "pitcher_hand", "team"], dropna=False)
     out = g.agg(
         pitches=("pitch_type", "size"),
         velo=("release_speed", "mean"),
@@ -137,9 +142,7 @@ def summarize(df: pd.DataFrame, min_pitches: int) -> pd.DataFrame:
         hb=("hb_in", "mean"),
         arm_angle=("arm_angle_deg", "mean"),
     ).reset_index()
-
-    out = out[out["pitches"] >= min_pitches].copy()
-    return out
+    return out[out["pitches"] >= min_pitches].copy()
 
 
 def diff_table(recent_sum: pd.DataFrame, base_sum: pd.DataFrame) -> pd.DataFrame:
@@ -161,10 +164,8 @@ def diff_table(recent_sum: pd.DataFrame, base_sum: pd.DataFrame) -> pd.DataFrame
 def shares_by(df_recent: pd.DataFrame, df_base: pd.DataFrame, col: str) -> pd.DataFrame:
     r = df_recent.groupby(col).size()
     b = df_base.groupby(col).size()
-
     r = (r / r.sum()).rename("recent") if r.sum() else r.rename("recent")
     b = (b / b.sum()).rename("baseline") if b.sum() else b.rename("baseline")
-
     out = pd.concat([r, b], axis=1).fillna(0)
     out["diff_pp"] = (out["recent"] - out["baseline"]) * 100
     return out.reset_index().sort_values("diff_pp", ascending=False)
@@ -181,10 +182,6 @@ def apply_batter_filter_for_heatmaps(d: pd.DataFrame, batter_filter: str) -> pd.
 
 
 def _smooth_2d(H: np.ndarray, passes: int = 2) -> np.ndarray:
-    """
-    Lightweight smoothing without extra dependencies.
-    A couple passes of neighbor averaging.
-    """
     if H.size == 0:
         return H
     A = H.astype(float).copy()
@@ -202,15 +199,11 @@ def _smooth_2d(H: np.ndarray, passes: int = 2) -> np.ndarray:
 
 
 def location_heatmap_working(df_pt: pd.DataFrame, title: str, zmax=None):
-    """
-    Works everywhere: 2D histogram + smoothing + strike zone box.
-    """
     d = df_pt.dropna(subset=["plate_x", "plate_z"]).copy()
     if d.empty:
         st.info(f"No location data for {title}")
         return None
 
-    # Plot window
     x_min, x_max = -2.0, 2.0
     z_min, z_max_plot = 0.5, 4.5
     d = d[(d["plate_x"].between(x_min, x_max)) & (d["plate_z"].between(z_min, z_max_plot))]
@@ -218,17 +211,12 @@ def location_heatmap_working(df_pt: pd.DataFrame, title: str, zmax=None):
         st.info(f"No location data in plotting window for {title}")
         return None
 
-    # Bin size (bigger bins = more "blob-like")
     bins = 40
     xedges = np.linspace(x_min, x_max, bins + 1)
     yedges = np.linspace(z_min, z_max_plot, bins + 1)
-
     H, _, _ = np.histogram2d(d["plate_x"], d["plate_z"], bins=[xedges, yedges])
 
-    # Smooth the histogram counts (makes blobs)
     Hs = _smooth_2d(H, passes=3)
-
-    # Normalize to percent (optional but nice)
     if Hs.sum() > 0:
         Hs = (Hs / Hs.sum()) * 100.0
 
@@ -236,47 +224,35 @@ def location_heatmap_working(df_pt: pd.DataFrame, title: str, zmax=None):
     ycent = (yedges[:-1] + yedges[1:]) / 2
 
     fig = go.Figure()
+    fig.add_trace(go.Heatmap(
+        x=xcent, y=ycent, z=Hs.T,
+        colorscale="RdBu_r",
+        zmin=0, zmax=zmax,
+        hovertemplate="plate_x=%{x:.2f}<br>plate_z=%{y:.2f}<br>share=%{z:.2f}%<extra></extra>"
+    ))
 
-    fig.add_trace(
-        go.Heatmap(
-            x=xcent,
-            y=ycent,
-            z=Hs.T,
-            colorscale="RdBu_r",  # red hot, blue cold
-            zmin=0,
-            zmax=zmax,
-            hovertemplate="plate_x=%{x:.2f}<br>plate_z=%{y:.2f}<br>share=%{z:.2f}%<extra></extra>"
-        )
-    )
+    fig.add_shape(type="rect", x0=-0.83, x1=0.83, y0=1.5, y1=3.5,
+                  line=dict(width=3, color="black"), fillcolor="rgba(0,0,0,0)")
 
-    # Strike zone rectangle
-    fig.add_shape(
-        type="rect",
-        x0=-0.83, x1=0.83,
-        y0=1.5, y1=3.5,
-        line=dict(width=3, color="black"),
-        fillcolor="rgba(0,0,0,0)"
-    )
-
-    fig.update_layout(
-        title=title,
-        height=450,
-        xaxis=dict(range=[x_min, x_max], title="plate_x", zeroline=False),
-        yaxis=dict(range=[z_min, z_max_plot], title="plate_z", zeroline=False),
-    )
-
+    fig.update_layout(title=title, height=450,
+                      xaxis=dict(range=[x_min, x_max], title="plate_x", zeroline=False),
+                      yaxis=dict(range=[z_min, z_max_plot], title="plate_z", zeroline=False))
     st.plotly_chart(fig, use_container_width=True)
     return float(Hs.max()) if Hs.size else None
 
 
-# -------------------- APP --------------------
-
+# ---------- UI ----------
 st.title("Pitcher Changes (Shiny-style, Python/Streamlit)")
 
 with st.sidebar:
-    st.header("Data")
-    csv_path = st.text_input("CSV path", value=CSV_PATH_DEFAULT)
-    df = load_data(csv_path)
+    st.header("Savant Pull")
+    default_start = date.today() - timedelta(days=120)
+    start_dt = st.date_input("Start date", value=default_start)
+    end_dt = st.date_input("End date", value=date.today())
+
+    if start_dt > end_dt:
+        st.error("Start date must be <= end date")
+        st.stop()
 
     st.header("Windows")
     last_days = st.slider("Recent window (days)", 7, 45, 21)
@@ -286,7 +262,10 @@ with st.sidebar:
     min_pitches = st.slider("Min pitches per pitch type (per window)", 10, 300, 50, step=10)
 
     st.header("Heatmap Batter Hand Only")
-    batter_filter_hm = st.radio("Heatmaps vs", ["All", "vs RHB", "vs LHB"], horizontal=False)
+    batter_filter_hm = st.radio("Heatmaps vs", ["All", "vs RHB", "vs LHB"])
+
+df_raw = fetch_statcast(start_dt.strftime("%Y-%m-%d"), end_dt.strftime("%Y-%m-%d"))
+df = prep_data(df_raw)
 
 recent, baseline, recent_start, baseline_start, max_date = window_split(df, last_days, baseline_days)
 
@@ -295,23 +274,17 @@ st.caption(
     f"**Baseline:** {baseline_start} → {(pd.to_datetime(recent_start) - pd.Timedelta(days=1)).date()}"
 )
 
-# Summaries + changes (NOT batter-filtered)
 recent_sum = summarize(recent, min_pitches=min_pitches)
 base_sum = summarize(baseline, min_pitches=min_pitches)
 changes = diff_table(recent_sum, base_sum)
 
-# Pitch filter for leaderboard
 all_pitches = sorted([p for p in df["pitch_type"].dropna().unique().tolist()])
 pitch_filter = st.selectbox("Leaderboard pitch filter", ["All"] + all_pitches, index=0)
 changes_view = changes if pitch_filter == "All" else changes[changes["pitch_type"] == pitch_filter].copy()
 
-# -------------------- LEADERBOARDS --------------------
 st.subheader("Leaderboards: Biggest Changes (Recent vs Baseline)")
-
 metric = st.selectbox("Metric", ["dVelo", "dIVB", "dHB", "dArmAngle"], index=1)
 n_show = st.slider("Rows", 10, 100, 30)
-
-col1, col2 = st.columns(2)
 
 show_cols = [
     "player_name", "team", "pitcher_hand", "pitch_type",
@@ -323,23 +296,21 @@ show_cols = [
     "pitches_recent", "pitches_base",
 ]
 
-with col1:
+c1, c2 = st.columns(2)
+with c1:
     st.markdown("### Biggest Gains")
     st.dataframe(changes_view.sort_values(metric, ascending=False).head(n_show)[show_cols], use_container_width=True)
-
-with col2:
+with c2:
     st.markdown("### Biggest Drops")
     st.dataframe(changes_view.sort_values(metric, ascending=True).head(n_show)[show_cols], use_container_width=True)
 
 st.divider()
-
-# -------------------- PITCHER DEEP DIVE --------------------
 st.subheader("Pitcher Deep Dive")
 
 pitchers = df[["pitcher", "player_name"]].dropna().drop_duplicates().sort_values("player_name")
 pitcher_name = st.selectbox("Select pitcher", pitchers["player_name"].tolist())
-
 pitcher_id = int(pitchers.loc[pitchers["player_name"] == pitcher_name, "pitcher"].iloc[0])
+
 p_all = df[df["pitcher"] == pitcher_id].copy()
 p_recent = recent[recent["pitcher"] == pitcher_id].copy()
 p_base = baseline[baseline["pitcher"] == pitcher_id].copy()
@@ -353,25 +324,20 @@ p_base_pt = p_base[p_base["pitch_type"] == pitch_type].copy()
 def mean_or_nan(s):
     return float(np.nanmean(s)) if len(s) else np.nan
 
-c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
-c1.metric("Recent pitches", f"{len(p_recent_pt):,}")
-c2.metric("Base pitches", f"{len(p_base_pt):,}")
-
+m1, m2, m3, m4, m5, m6, m7 = st.columns(7)
+m1.metric("Recent pitches", f"{len(p_recent_pt):,}")
+m2.metric("Base pitches", f"{len(p_base_pt):,}")
 rv, bv = mean_or_nan(p_recent_pt["release_speed"]), mean_or_nan(p_base_pt["release_speed"])
-c3.metric("Velo (mph)", f"{rv:.2f}", f"{(rv - bv):+.2f}")
-
+m3.metric("Velo (mph)", f"{rv:.2f}", f"{(rv - bv):+.2f}")
 ri, bi = mean_or_nan(p_recent_pt["ivb_in"]), mean_or_nan(p_base_pt["ivb_in"])
-c4.metric("iVB-ish (in)", f"{ri:.2f}", f"{(ri - bi):+.2f}")
-
+m4.metric("iVB-ish (in)", f"{ri:.2f}", f"{(ri - bi):+.2f}")
 rh, bh = mean_or_nan(p_recent_pt["hb_in"]), mean_or_nan(p_base_pt["hb_in"])
-c5.metric("HB (in)", f"{rh:.2f}", f"{(rh - bh):+.2f}")
-
+m5.metric("HB (in)", f"{rh:.2f}", f"{(rh - bh):+.2f}")
 ra, ba = mean_or_nan(p_recent_pt["arm_angle_deg"]), mean_or_nan(p_base_pt["arm_angle_deg"])
-c6.metric("Arm angle (deg)", f"{ra:.2f}", f"{(ra - ba):+.2f}")
-
+m6.metric("Arm angle (deg)", f"{ra:.2f}", f"{(ra - ba):+.2f}")
 recent_usage = (p_recent_pt.shape[0] / p_recent.shape[0]) if p_recent.shape[0] else np.nan
 base_usage = (p_base_pt.shape[0] / p_base.shape[0]) if p_base.shape[0] else np.nan
-c7.metric("Usage share", f"{recent_usage * 100:.1f}%", f"{(recent_usage - base_usage) * 100:+.1f} pp")
+m7.metric("Usage share", f"{recent_usage * 100:.1f}%", f"{(recent_usage - base_usage) * 100:+.1f} pp")
 
 st.markdown("### Usage Splits (Recent vs Baseline)")
 u1, u2 = st.columns(2)
@@ -383,22 +349,18 @@ with u2:
     st.dataframe(shares_by(p_recent_pt, p_base_pt, "tto"), use_container_width=True)
 
 st.divider()
-
-# -------------------- HEATMAPS (batter-filter ONLY here) --------------------
 st.subheader("Location Heatmaps")
 
 p_recent_pt_hm = apply_batter_filter_for_heatmaps(p_recent_pt, batter_filter_hm)
 p_base_pt_hm = apply_batter_filter_for_heatmaps(p_base_pt, batter_filter_hm)
 
-hm1, hm2 = st.columns(2)
-with hm1:
-    z1 = location_heatmap_working(p_recent_pt_hm, f"{pitcher_name} {pitch_type} — Recent ({batter_filter_hm})", zmax=None)
-with hm2:
+h1, h2 = st.columns(2)
+with h1:
+    z1 = location_heatmap_working(p_recent_pt_hm, f"{pitcher_name} {pitch_type} — Recent ({batter_filter_hm})")
+with h2:
     location_heatmap_working(p_base_pt_hm, f"{pitcher_name} {pitch_type} — Baseline ({batter_filter_hm})", zmax=z1)
 
 st.divider()
-
-# -------------------- TREND --------------------
 st.subheader("Trend over time (rolling)")
 
 roll_days = st.slider("Rolling window (days)", 3, 30, 7)
@@ -412,11 +374,7 @@ daily = trend.groupby("date")[metric2].mean().reset_index()
 daily["date"] = pd.to_datetime(daily["date"])
 daily[f"{metric2}_roll"] = daily[metric2].rolling(roll_days, min_periods=max(2, roll_days // 2)).mean()
 
-fig = px.line(
-    daily,
-    x="date",
-    y=[metric2, f"{metric2}_roll"],
-    title=f"{pitcher_name} {pitch_type} — {metric2} (daily + rolling)"
-)
+fig = px.line(daily, x="date", y=[metric2, f"{metric2}_roll"],
+              title=f"{pitcher_name} {pitch_type} — {metric2} (daily + rolling)")
 fig.update_layout(height=420)
 st.plotly_chart(fig, use_container_width=True)
